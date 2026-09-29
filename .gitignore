@@ -1,6 +1,8 @@
 .DS_Store
 Thumbs.db
-node_modules/
+# Only the repository root. The pinned cli-continues runtime under
+# third_party/cli-continues/node_modules is part of the checkout.
+/node_modules/
 *.log
 *.tmp
 *.swp

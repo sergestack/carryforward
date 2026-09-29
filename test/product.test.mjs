@@ -512,6 +512,7 @@ test('an empty home can run help, setup, status, doctor, and agents', () => {
   const doctor = spawnSync(bin, ['doctor'], { encoding: 'utf8', env });
   assert.equal(doctor.status, 0, doctor.stderr);
   assert.match(doctor.stdout, /CarryForward doctor/);
+  assert.match(doctor.stdout, /cli-continues 4\.1\.1/);
   assert.match(doctor.stdout, /none found/);
   const agents = spawnSync(bin, ['agents'], { encoding: 'utf8', env });
   assert.equal(agents.status, 0, agents.stderr);

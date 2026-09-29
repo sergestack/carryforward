@@ -14,7 +14,7 @@ carryforward setup
 carryforward run codex:default
 ```
 
-`install.sh` links `~/.local/bin/carryforward` at this checkout. It does not need sudo. An existing CarryForward config is left alone. If `~/.local/bin` is not on `PATH`, the installer prints the full command to run.
+`install.sh` links `~/.local/bin/carryforward` at this checkout. It does not need sudo, and it does not download anything. An existing CarryForward config is left alone. If `~/.local/bin` is not on `PATH`, the installer prints the full command to run. If the bundled extractor is missing or does not match its pin, the installer stops and leaves `~/.local/bin/carryforward` unchanged.
 
 `carryforward setup` lists what it found, groups Codex profiles that share an allowance, and asks before saving a chain. The chain keeps one profile from each independent quota pool. Within a pool, CarryForward prefers the profile named `default`. Otherwise it uses the profile name that sorts first. The account id is not a sort key and is not written to disk.
 
@@ -109,7 +109,7 @@ This removes CarryForward command links that point at this install, and the Carr
 
 Context extraction comes from [cli-continues](https://github.com/yigitkonur/cli-continues) v4.1.1, MIT, Copyright (c) 2025-2026 Yigit Konur, pinned at `e486cd22a592d89d890cff056624647fbe9cbe80`. See `NOTICE.md` and `third_party/cli-continues/LICENSE`. CarryForward calls the library parsers only.
 
-The runtime copy belongs at `~/.local/share/carryforward/cli-continues`. `CARRYFORWARD_VENDOR` can point at another checkout of that same pin.
+That commit's compiled runtime ships in this repository at `third_party/cli-continues`, with its MIT license and the production dependencies the parsers load. Installation does not fetch it. `CARRYFORWARD_VENDOR` can point at another checkout of that same pin.
 
 ## License
 

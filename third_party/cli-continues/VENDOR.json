@@ -3,5 +3,13 @@
   "version": "4.1.1",
   "upstream": "https://github.com/yigitkonur/cli-continues",
   "commit": "e486cd22a592d89d890cff056624647fbe9cbe80",
-  "license": "MIT"
+  "license": "MIT",
+  "sha256": {
+    "package.json": "f80c9eba739f5aae3a30c3ab331340314a08505162b11ce9579ca79fed5e1c13",
+    "package-lock.json": "26fa90544ab2403005f952f20950917e1cd46a296841cd8f75157cdfb2077045",
+    "dist/parsers/codex.js": "19573d7ab5a1ff8bc770d8b17cf83a2956479dd2a2807feceb835ccb6b02b536",
+    "dist/parsers/claude.js": "ba1b1ff15238aaaf15314b771c39f14d002ef6a29312641f35dc90c7a95d2897",
+    "dist/config/index.js": "0fda7870f9ac822bdb530e2330c38c114cf915a176e485bebd4d63ad6edf76f5",
+    "dist/utils/resume.js": "456c9f8da441b55ed52790610f14f58270ce34e9bdac94b97fae66a978211222"
+  }
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // carryforward — keep Codex work moving when one account reaches its limit.
 //
-// Powered by the pinned cli-continues extraction library (no bin/CLI layer,
-// no npm install at runtime, no external API calls). See VENDOR.json next to
-// the installed library copy for the exact upstream commit.
+// Powered by the pinned cli-continues extraction library shipped at
+// third_party/cli-continues (no separate CLI, no npm install at runtime,
+// no external API calls). See third_party/cli-continues/VENDOR.json for the
+// exact upstream commit.
 //
 // Launch targets come from the agent registry (`agent:profile`).
 // A handoff is always a fresh launch with the extracted context in the
@@ -45,25 +46,10 @@ import { runStatus as runProductStatus } from '../lib/status/command.js';
 import { matchBoundSession } from '../lib/supervisor/bind.js';
 import { runSupervised } from '../lib/supervisor/command.js';
 import { runUsage } from '../lib/usage/command.js';
+import { resolveVendorDir } from '../lib/runtime.js';
 
 const PROGRAM = 'carryforward';
 const HOME_DIR = os.homedir();
-
-function resolveVendorDir() {
-  const candidates = [
-    process.env.CARRYFORWARD_VENDOR,
-    path.join(HOME_DIR, '.local', 'share', 'carryforward', 'cli-continues'),
-  ].filter(Boolean);
-  for (const dir of candidates) {
-    try {
-      if (fs.existsSync(path.join(dir, 'dist', 'parsers', 'codex.js'))) return dir;
-    } catch {
-      // try the next candidate
-    }
-  }
-  return candidates[candidates.length - 1];
-}
-
 const VENDOR = resolveVendorDir();
 
 function defaultCacheDir() {

@@ -13,7 +13,10 @@
     "NOTICE.md",
     "README.md",
     "third_party/cli-continues/LICENSE",
-    "third_party/cli-continues/VENDOR.json"
+    "third_party/cli-continues/VENDOR.json",
+    "third_party/cli-continues/package.json",
+    "third_party/cli-continues/package-lock.json",
+    "third_party/cli-continues/dist"
   ],
   "bin": {
     "carryforward": "./bin/carryforward"
@@ -22,7 +25,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test test/smoke.mjs test/agents.test.mjs test/targets.test.mjs test/usage.test.mjs test/policy.test.mjs test/supervisor.test.mjs test/setup.test.mjs test/product.test.mjs",
+    "test": "node --test test/smoke.mjs test/agents.test.mjs test/targets.test.mjs test/usage.test.mjs test/policy.test.mjs test/supervisor.test.mjs test/setup.test.mjs test/product.test.mjs test/handoff.test.mjs",
     "start": "node ./bin/carryforward"
   }
 }
