@@ -1,0 +1,1160 @@
+#!/usr/bin/env node
+// carryforward — keep Codex work moving when one account reaches its limit.
+//
+// Powered by the pinned cli-continues extraction library (no bin/CLI layer,
+// no npm install at runtime, no external API calls). See VENDOR.json next to
+// the installed library copy for the exact upstream commit.
+//
+// Launch targets come from the agent registry (`agent:profile`).
+// A handoff is always a fresh launch with the extracted context in the
+// first message. Native resume is not used: profiles have separate homes,
+// and resume cannot see across them.
+// - No .continues-handoff.md or any other file is written to the target
+//   project. Large handoffs are written to a private local cache file and the
+//   successor receives only a tiny bootstrap prompt pointing at it. This avoids
+//   OS argv/env limits while still never writing into a project repo.
+// - Preset choice defaults from how the predecessor session actually ended
+//   (abrupt usage-limit/error/mid-turn death -> full; clean stop -> standard),
+//   because a real abrupt Codex death showed minimal/standard silently drop
+//   the crash evidence — only `full` keeps it, since it lives in raw tool
+//   output rather than the assistant's own closing summary.
+
+import { spawn, execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { runAgents } from '../lib/agents/command.js';
+import { machineProbe } from '../lib/agents/probe.js';
+import { discoverAgents } from '../lib/agents/registry.js';
+import {
+  canonicalTargetId,
+  destinationFailure,
+  destinationProfiles,
+  profileByTarget,
+  resolveDestination,
+  resolveSource,
+  sourceProfiles,
+} from '../lib/agents/targets.js';
+import { runTargets } from '../lib/agents/targets-command.js';
+import { runFallback, runNext } from '../lib/policy/command.js';
+import { runDoctor } from '../lib/doctor/command.js';
+import { runUninstall } from '../lib/install/uninstall.js';
+import { runSetup } from '../lib/setup/command.js';
+import { runStatus as runProductStatus } from '../lib/status/command.js';
+import { matchBoundSession } from '../lib/supervisor/bind.js';
+import { runSupervised } from '../lib/supervisor/command.js';
+import { runUsage } from '../lib/usage/command.js';
+
+const PROGRAM = 'carryforward';
+const HOME_DIR = os.homedir();
+
+function resolveVendorDir() {
+  const candidates = [
+    process.env.CARRYFORWARD_VENDOR,
+    path.join(HOME_DIR, '.local', 'share', 'carryforward', 'cli-continues'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(path.join(dir, 'dist', 'parsers', 'codex.js'))) return dir;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return candidates[candidates.length - 1];
+}
+
+const VENDOR = resolveVendorDir();
+
+function defaultCacheDir() {
+  return path.join(HOME_DIR, '.cache', 'carryforward');
+}
+
+let PAYLOAD_DIR = defaultCacheDir();
+const PAYLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Filled by loadCatalog(). Every handoff target comes from this list.
+let catalog = [];
+
+function loadCatalog() {
+  catalog = discoverAgents(machineProbe());
+  return catalog;
+}
+
+function agentOf(targetId) {
+  const index = String(targetId).indexOf(':');
+  return index === -1 ? targetId : targetId.slice(0, index);
+}
+
+function labelFor(targetId) {
+  const profile = profileByTarget(catalog, targetId);
+  if (!profile) return targetId;
+  return `${profile.displayName} (${profile.target})`;
+}
+
+function nextDestination(sourceTarget) {
+  const dests = destinationProfiles(catalog);
+  if (!dests.length) return undefined;
+  const index = dests.findIndex((profile) => profile.target === sourceTarget);
+  return dests[(index + 1) % dests.length].target;
+}
+
+const LARGE_TOKEN_THRESHOLD = 30000;
+const AMBIGUITY_GAP_MS = 10 * 60 * 1000; // 10 minutes
+
+// ── Token-stack visibility (RTK + Caveman response mode) ────────────────
+//
+// This is informational only: carryforward does not alter, wrap, or re-run the
+// cli-continues handoff through RTK or Caveman. The successor is launched via
+// the discovered executable for that profile, which may already load a
+// shared RTK+Caveman instruction file (~/.config/ai-token-stack/AGENTS.md).
+// These
+// checks exist only to surface whether that stack is actually in place for
+// the successor, never to gate the launch on it (see checks below: every
+// failure here is a warning, never a process.exit).
+function checkRtk() {
+  try {
+    const out = execFileSync('rtk', ['--version'], { encoding: 'utf8', timeout: 3000 }).trim();
+    return { ok: true, version: out.replace(/^rtk\s+/i, '') || out };
+  } catch (err) {
+    return { ok: false, version: null, detail: err.code === 'ENOENT' ? 'not found on PATH' : String(err.message || err) };
+  }
+}
+
+// Claude: provable via the caveman@caveman plugin + its active-level marker
+// file, both written by machinery outside carryforward -> "active".
+// Codex Main/Second: no runtime hook to prove enforcement from here, only
+// that the shared instruction file is wired in and contains the
+// response-mode section -> report "configured", never a false "active".
+function checkCaveman(targetId) {
+  const profile = profileByTarget(catalog, targetId);
+  if (!profile) return { state: 'not detected', detail: 'unknown target' };
+  if (profile.agent === 'grok') {
+    return { state: 'not configured', detail: 'Grok launcher is independent of the Claude/Codex AGENTS.md stack' };
+  }
+  if (profile.agent === 'claude') {
+    const settingsPath = path.join(profile.configPath, 'settings.json');
+    const markerPath = path.join(profile.configPath, '.caveman-active');
+    let pluginEnabled = false;
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      pluginEnabled = settings.enabledPlugins?.['caveman@caveman'] === true;
+    } catch {
+      // fall through with pluginEnabled=false
+    }
+    let level = null;
+    try {
+      level = fs.readFileSync(markerPath, 'utf8').trim();
+    } catch {
+      // no marker file -> can't claim active
+    }
+    if (pluginEnabled && level) return { state: 'active', detail: `level: ${level}` };
+    if (pluginEnabled) return { state: 'configured', detail: 'plugin enabled, no active-level marker found' };
+    return { state: 'not detected', detail: 'caveman@caveman plugin not enabled in Claude settings' };
+  }
+  if (profile.agent !== 'codex') {
+    return { state: 'not configured', detail: 'no caveman check for this agent' };
+  }
+  const agentsPath = path.join(profile.configPath, 'AGENTS.md');
+  try {
+    const real = fs.realpathSync(agentsPath);
+    const text = fs.readFileSync(real, 'utf8');
+    if (/CAVEMAN RESPONSE MODE/i.test(text)) {
+      return { state: 'configured', detail: `via ${real}` };
+    }
+    return { state: 'not detected', detail: `${real} has no CAVEMAN RESPONSE MODE section` };
+  } catch (err) {
+    return { state: 'not detected', detail: `could not read ${agentsPath}: ${err.message}` };
+  }
+}
+
+// Structural fact about this script, not a runtime probe: carryforward never
+// shells out to caveman-proxy/caveman-shrink/caveman-engine, and never will
+// as part of this mission. Caveman Proxy is a separate, not-yet-proven
+// project and stays untouched here.
+function checkCavemanProxy() {
+  return { state: 'OFF', detail: 'carryforward never invokes it; out of scope for this mission' };
+}
+
+function padDots(label, width) {
+  const dots = Math.max(1, width - label.length);
+  return label + ' ' + '.'.repeat(dots) + ' ';
+}
+
+function printTokenStack(targetId) {
+  const rtk = checkRtk();
+  const caveman = checkCaveman(targetId);
+  const proxy = checkCavemanProxy();
+  const agent = agentOf(targetId);
+  console.log('\nToken stack:');
+  // RTK's binary presence is global, but whether GROK's own agent loop reads
+  // it is unknown from here (Grok doesn't share the Claude/Codex AGENTS.md) —
+  // report that honestly instead of implying it's wired in.
+  const rtkLine = agent === 'grok' ? 'not applicable / unknown' : rtk.ok ? 'OK' : `NOT FOUND (${rtk.detail})`;
+  console.log(`  ${padDots(agent === 'grok' ? 'RTK' : rtk.ok ? `RTK ${rtk.version}` : 'RTK', 20)}${rtkLine}`);
+  console.log(`  ${padDots('Caveman response', 20)}${caveman.state}`);
+  console.log(`  ${padDots('Caveman Proxy', 20)}${proxy.state}`);
+  if (!rtk.ok) {
+    console.log('  WARNING: RTK not found — successor can still launch.');
+  }
+  if (caveman.state === 'not detected') {
+    console.log(`  WARNING: Caveman response mode not detected (${caveman.detail}) — successor can still launch.`);
+  }
+}
+
+let importSeq = 0;
+
+async function loadParserModule(targetId) {
+  const profile = profileByTarget(catalog, targetId);
+  if (!profile?.handoff.source) return null;
+  if (profile.agent === 'codex') {
+    const prevHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = profile.configPath;
+    const mod = await import(`${VENDOR}/dist/parsers/codex.js?ctx=${targetId}-${importSeq++}`);
+    if (prevHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevHome;
+    return { parse: mod.parseCodexSessions, extract: mod.extractCodexContext };
+  }
+  if (profile.agent === 'claude') {
+    const prevHome = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = profile.configPath;
+    const mod = await import(`${VENDOR}/dist/parsers/claude.js?ctx=${targetId}-${importSeq++}`);
+    if (prevHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevHome;
+    return { parse: mod.parseClaudeSessions, extract: mod.extractClaudeContext };
+  }
+  return null;
+}
+
+let getPresetCache = null;
+async function getPreset(name) {
+  if (!getPresetCache) {
+    getPresetCache = (await import(`${VENDOR}/dist/config/index.js`)).getPreset;
+  }
+  return getPresetCache(name);
+}
+
+let getDefaultHandoffInitArgsCache = null;
+async function getDefaultHandoffInitArgs(target, forwarded) {
+  if (!getDefaultHandoffInitArgsCache) {
+    getDefaultHandoffInitArgsCache = (await import(`${VENDOR}/dist/utils/resume.js`)).getDefaultHandoffInitArgs;
+  }
+  return getDefaultHandoffInitArgsCache(target, forwarded);
+}
+
+// The interactive menu is a thin frontend reusing upstream cli-continues'
+// own TUI dependency (@clack/prompts, already vendored — never added on top
+// of it). Its raw-mode/cancel-key handling is what upstream's own picker
+// (src/commands/pick.ts) relies on; we only supply our own session/target
+// data and hand off into the SAME describeHandoff/executeLaunch functions
+// the plain CLI path uses, so there is exactly one backend either way.
+let clackCache = null;
+async function loadClack() {
+  if (!clackCache) {
+    clackCache = await import(`${VENDOR}/node_modules/@clack/prompts/dist/index.mjs`);
+    // 'q' to cancel, in addition to clack's built-in Escape/Ctrl-C. j/k for
+    // up/down are already default aliases in @clack/core.
+    clackCache.updateSettings({ aliases: { q: 'cancel' } });
+  }
+  return clackCache;
+}
+
+async function allSessionsFor(targetId) {
+  const loaded = await loadParserModule(targetId);
+  if (!loaded) return [];
+  const { parse } = loaded;
+  // Deliberately no cwd filter here: cli-continues' own cwd matching only
+  // catches sessions whose cwd is the same dir or a DESCENDANT of the query
+  // dir. A predecessor that died running from a parent/home directory
+  // (cwd=$HOME while the work lived in a project two levels down) would be
+  // invisible to that filter. We fetch everything and score cwd relevance
+  // ourselves instead.
+  const sessions = await parse({ lightweight: true });
+  return sessions.map((s) => ({ ...s, __identity: targetId }));
+}
+
+function scoreCwd(sessionCwd, currentCwd) {
+  if (!sessionCwd) return 0;
+  const s = sessionCwd.replace(/\/+$/, '');
+  const c = currentCwd.replace(/\/+$/, '');
+  if (s === c) return 100;
+  if (c.startsWith(s + '/')) return 70; // session ran from an ancestor dir (abrupt-death shape)
+  if (s.startsWith(c + '/')) return 60; // session ran from a subdirectory
+  return 0;
+}
+
+async function collectTopPerIdentity(identities, cwd) {
+  const results = [];
+  for (const id of identities) {
+    const sessions = await allSessionsFor(id);
+    if (!sessions.length) continue;
+    sessions.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    const top = sessions[0];
+    results.push({ identity: id, session: top, score: scoreCwd(top.cwd, cwd) });
+  }
+  return results;
+}
+
+function pickFromCandidates(candidates) {
+  if (candidates.length === 0) return { status: 'none' };
+  if (candidates.length === 1) return { status: 'ok', pick: candidates[0] };
+  const cwdHits = candidates.filter((c) => c.score >= 60);
+  if (cwdHits.length === 1) return { status: 'ok', pick: cwdHits[0], note: 'current-directory match' };
+  const byRecency = [...candidates].sort((a, b) => new Date(b.session.updatedAt) - new Date(a.session.updatedAt));
+  const gap = new Date(byRecency[0].session.updatedAt) - new Date(byRecency[1].session.updatedAt);
+  if (gap > AMBIGUITY_GAP_MS) {
+    return { status: 'ok', pick: byRecency[0], note: 'most recent (directory match was inconclusive)' };
+  }
+  return { status: 'ambiguous', candidates: byRecency };
+}
+
+async function findBySessionId(idOrPrefix, sourceHint) {
+  const identities = sourceHint
+    ? sourceProfiles(catalog).filter((profile) => profile.target === canonicalTargetId(sourceHint)).map((profile) => profile.target)
+    : sourceProfiles(catalog).map((profile) => profile.target);
+  for (const identity of identities) {
+    const sessions = await allSessionsFor(identity);
+    const hit = sessions.find((s) => s.id === idOrPrefix || s.id.startsWith(idOrPrefix));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function tailText(filePath, maxBytes = 20000) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const stat = fs.fstatSync(fd);
+    const start = Math.max(0, stat.size - maxBytes);
+    const buf = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    return buf.toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Abrupt-ending detection for Codex: walk backwards from the tail looking for
+// the last lifecycle `task_complete` event. A provider error there (for
+// example `usage_limit_exceeded`) or the total absence of one near the end
+// of the file both mean the predecessor died mid-turn.
+function classifyCodexEnding(originalPath) {
+  let lines;
+  try {
+    lines = tailText(originalPath).split('\n').filter(Boolean);
+  } catch (err) {
+    return { abrupt: true, reason: `could not read session file (${err.message})` };
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let obj;
+    try {
+      obj = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (obj?.type === 'event_msg' && obj.payload?.type === 'task_complete') {
+      const err = obj.payload.error;
+      if (err) {
+        return { abrupt: true, reason: (err.message || err.codex_error_info || 'provider error').slice(0, 160) };
+      }
+      if (!obj.payload.last_agent_message) {
+        return { abrupt: true, reason: 'turn completed with no final message' };
+      }
+      return { abrupt: false, reason: 'clean task_complete with a final message' };
+    }
+  }
+  return { abrupt: true, reason: 'session file ends mid-turn (no task_complete found near tail)' };
+}
+
+// Best-effort heuristic for Claude Code sessions. Not validated against an
+// observed abrupt Claude death — see KNOWN LIMITATIONS in the README. Errs
+// toward "abrupt" on any doubt, since an unnecessary `full` preset costs
+// tokens but a wrongly-`standard` preset can silently drop the evidence
+// that matters.
+function classifyClaudeEnding(originalPath) {
+  let raw;
+  try {
+    raw = tailText(originalPath);
+  } catch (err) {
+    return { abrupt: true, reason: `could not read session file (${err.message})` };
+  }
+  if (/usage[\s_-]?limit|rate[\s_-]?limit|overloaded_error|quota exhausted/i.test(raw)) {
+    return { abrupt: true, reason: 'usage/rate-limit signal found near end of session' };
+  }
+  const lines = raw.split('\n').filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let obj;
+    try {
+      obj = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (obj?.type === 'error' || obj?.isApiErrorMessage === true) {
+      return { abrupt: true, reason: 'error event near end of session' };
+    }
+    if (obj?.type === 'assistant' && obj.message?.stop_reason) {
+      const sr = obj.message.stop_reason;
+      if (sr === 'end_turn' || sr === 'stop_sequence') {
+        return { abrupt: false, reason: `clean stop_reason=${sr}` };
+      }
+      return { abrupt: true, reason: `non-terminal stop_reason=${sr} at end of session` };
+    }
+  }
+  return { abrupt: false, reason: 'no error signals found (best-effort heuristic, unverified against a real case)' };
+}
+
+function classifyEnding(targetId, originalPath) {
+  return agentOf(targetId) === 'claude' ? classifyClaudeEnding(originalPath) : classifyCodexEnding(originalPath);
+}
+
+// Compact label for the menu only — a display mapping over the SAME
+// classifyEnding() result used everywhere else, not a second classifier.
+function endingLabel(ending) {
+  if (/could not read/i.test(ending.reason)) return 'unknown';
+  if (ending.abrupt && /usage[\s_-]?limit|rate[\s_-]?limit|quota/i.test(ending.reason)) return 'LIMIT';
+  return ending.abrupt ? 'abrupt' : 'clean';
+}
+
+// TODAY 12:42 PM / YEST 8:50 PM / SEP 5 7:12 PM / SEP 5 2025 7:12 PM (only
+// when the year isn't the current one) — makes cross-day ordering legible
+// without changing what's ranked where.
+function formatDateTime(d) {
+  try {
+    const date = new Date(d);
+    const now = new Date();
+    const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    if (date.toDateString() === now.toDateString()) return `TODAY ${time}`;
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    if (date.toDateString() === yesterday.toDateString()) return `YEST ${time}`;
+    const monthDay = date.toLocaleDateString([], { month: 'short', day: 'numeric' }).toUpperCase();
+    return date.getFullYear() === now.getFullYear() ? `${monthDay} ${time}` : `${monthDay} ${date.getFullYear()} ${time}`;
+  } catch {
+    return '?';
+  }
+}
+
+// First-level directories under HOME_DIR that are tool/config state, never a
+// project — always excluded from the transcript path-scan fallback below.
+const NOISE_PROJECT_SEGMENTS = new Set([
+  '.claude', '.config', '.cache',
+  '.local', '.npm', '.nvm', '.git', '.ssh',
+  'bin', 'Videos', 'Documents', 'Downloads', 'tmp',
+]);
+
+// Signal 1 (strongest): walk up from a cwd looking for a `.git` — works for
+// both a repo root and a subdirectory inside one, and for worktrees (`.git`
+// is a file there, not a dir; existsSync doesn't care). Pure local fs stats,
+// no reads, effectively free even across 20 rows.
+function findGitRoot(startDir) {
+  let dir = startDir;
+  for (let i = 0; i < 8 && dir && dir !== '/'; i++) {
+    try {
+      if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    } catch {
+      // ignore and keep walking
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// Signals 2-4 (tool calls / referenced paths) for the case cwd itself is
+// broad (e.g. a session run from $HOME): scan a BOUNDED slice of the raw
+// session file — not the whole transcript — for $HOME/<project>/...
+// references and take the most frequently mentioned project directory.
+// Bounded to ~80KB total per session and only ever run for the rows that
+// actually get displayed (gatherMenuRows slices to `limit` BEFORE this is
+// called), so this stays cheap regardless of how many sessions exist.
+function scanForProjectPath(originalPath) {
+  let text = '';
+  try {
+    const fd = fs.openSync(originalPath, 'r');
+    try {
+      const stat = fs.fstatSync(fd);
+      const headLen = Math.min(stat.size, 60000);
+      const headBuf = Buffer.alloc(headLen);
+      fs.readSync(fd, headBuf, 0, headLen, 0);
+      text += headBuf.toString('utf8');
+      if (stat.size > headLen) {
+        const tailLen = Math.min(stat.size - headLen, 20000);
+        const tailBuf = Buffer.alloc(tailLen);
+        fs.readSync(fd, tailBuf, 0, tailLen, stat.size - tailLen);
+        text += `\n${tailBuf.toString('utf8')}`;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+
+  const escapedHome = HOME_DIR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`${escapedHome}/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?`, 'g');
+  const counts = new Map();
+  let m;
+  while ((m = re.exec(text))) {
+    const seg1 = m[1];
+    if (seg1.startsWith('.') || NOISE_PROJECT_SEGMENTS.has(seg1)) continue;
+    const label = seg1;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  if (!counts.size) return null;
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+// Priority order per the design doc: git/worktree root (works even for a
+// subdirectory cwd) -> cwd itself if already specific -> bounded transcript
+// scan for a concrete project path -> plain cwd basename as last resort.
+// Returns {label, anchor}: `anchor` is what actually identifies "the same
+// project" for duplicate-detection — the git root when found (so a session
+// run from a subdirectory and one run from the repo root don't get falsely
+// treated as different projects), otherwise the cwd itself.
+function inferProjectLabel(row) {
+  const cwd = row.session.cwd ? row.session.cwd.replace(/\/+$/, '') : '';
+  if (cwd) {
+    const gitRoot = findGitRoot(cwd);
+    if (gitRoot && gitRoot !== HOME_DIR) return { label: path.basename(gitRoot), anchor: gitRoot };
+    if (cwd !== HOME_DIR) return { label: path.basename(cwd), anchor: cwd };
+  }
+  // Below this point we have no confirmed absolute path for "the project" —
+  // just a guessed name (or nothing at all). anchor:null deliberately does
+  // NOT get compared for duplicate-detection (see projectLabels): a scan
+  // guess and a git-root hit that happen to produce the same label almost
+  // certainly ARE the same real project, and should not get flagged as if
+  // they were two different ones just because this branch can't prove it
+  // with a real path the way findGitRoot/cwd above can.
+  const guess = scanForProjectPath(row.session.originalPath);
+  if (guess) return { label: guess, anchor: null };
+  return { label: cwd ? path.basename(cwd) || cwd : '(unknown)', anchor: null };
+}
+
+// Up to `limit` most relevant sessions across all three identities, ranked
+// by the SAME scoreCwd() priority used by CLI auto-detection (exact cwd >
+// ancestor/descendant > everything else, recency breaks ties within each
+// band) — reused rather than a separate menu-only ranking. Only the rows
+// that actually get displayed pay the cost of reading their tail for ending
+// classification.
+async function gatherMenuRows(cwd, limit = 20) {
+  const scored = [];
+  for (const profile of sourceProfiles(catalog)) {
+    const identity = profile.target;
+    const sessions = await allSessionsFor(identity);
+    for (const session of sessions) {
+      scored.push({ identity, session, score: scoreCwd(session.cwd, cwd) });
+    }
+  }
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return new Date(b.session.updatedAt) - new Date(a.session.updatedAt);
+  });
+  const top = scored.slice(0, limit);
+  for (const row of top) {
+    row.ending = classifyEnding(row.identity, row.session.originalPath);
+  }
+  return top;
+}
+
+// One label per row via inferProjectLabel(). Only when the SAME label hides
+// genuinely DIFFERENT directories (~/projects/foo vs ~/archive/foo) does a
+// row get a short-session-id suffix — multiple sessions sharing the exact
+// same project, the common case, stay as the plain label with no suffix.
+function projectLabels(rows) {
+  const inferred = rows.map((r) => inferProjectLabel(r));
+  // Only count rows with a confirmed absolute-path anchor (git root or cwd)
+  // toward "is this label actually ambiguous" — a null-anchor guess sharing
+  // a label with a real-path hit is almost certainly the same project, not
+  // a collision, and must not get flagged just because it can't prove it.
+  const realAnchorsByLabel = {};
+  inferred.forEach(({ label, anchor }) => {
+    if (anchor == null) return;
+    (realAnchorsByLabel[label] ??= new Set()).add(anchor);
+  });
+  return inferred.map(({ label }, i) => ({
+    label,
+    idSuffix: (realAnchorsByLabel[label]?.size ?? 0) > 1 ? rows[i].session.id.slice(0, 8) : null,
+  }));
+}
+
+function formatMenuRow(row, projectInfo) {
+  const agent = labelFor(row.identity).padEnd(22);
+  const label = projectInfo.label;
+  const proj = (label.length > 20 ? `${label.slice(0, 17)}...` : label).padEnd(20);
+  const when = formatDateTime(row.session.updatedAt).padEnd(15);
+  const status = endingLabel(row.ending).padEnd(7);
+  const idPart = projectInfo.idSuffix || '';
+  return `${agent} ${proj} ${when} ${status}${idPart}`.trimEnd();
+}
+
+function buildPrompt(sourceIdentity, session, markdown, go) {
+  const label = labelFor(sourceIdentity);
+  const ref = session.originalPath ? ` (original session: \`${session.originalPath}\`)` : '';
+  let prompt = `I'm continuing a coding session from **${label}**${ref}. Here's the full context:\n\n---\n\n${markdown}`;
+  if (go) prompt += `\n\n---\n\n**Continue the work.**`;
+  return prompt;
+}
+
+function byteLen(value) {
+  return Buffer.byteLength(String(value), 'utf8');
+}
+
+function serializedBytes(values) {
+  return values.reduce((total, value) => total + byteLen(value) + 1, 0);
+}
+
+function ensurePayloadDir() {
+  fs.mkdirSync(PAYLOAD_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(PAYLOAD_DIR, 0o700);
+}
+
+function cacheDirsToSweep() {
+  const dirs = [];
+  const seen = new Set();
+  for (const dir of [PAYLOAD_DIR]) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const real = fs.realpathSync(dir);
+      if (seen.has(real)) continue;
+      seen.add(real);
+      dirs.push(dir);
+    } catch {
+      // ignore an unreadable cache dir
+    }
+  }
+  return dirs;
+}
+
+function cleanupStalePayloads() {
+  try {
+    ensurePayloadDir();
+    const now = Date.now();
+    for (const dir of cacheDirsToSweep()) {
+      let names;
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (!/^handoff-\d+-[a-f0-9]{32}\.md$/.test(name)) continue;
+        const filePath = path.join(dir, name);
+        let stat;
+        try {
+          stat = fs.statSync(filePath);
+        } catch {
+          continue;
+        }
+        if (!stat.isFile()) continue;
+        if (now - stat.mtimeMs > PAYLOAD_TTL_MS) {
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+            // best-effort cleanup only
+          }
+        }
+      }
+    }
+  } catch {
+    // Launch continuity is more important than stale-cache cleanup.
+  }
+}
+
+function writePayloadFile(prompt) {
+  ensurePayloadDir();
+  const name = `handoff-${Date.now()}-${crypto.randomBytes(16).toString('hex')}.md`;
+  const filePath = path.join(PAYLOAD_DIR, name);
+  fs.writeFileSync(filePath, prompt, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  fs.chmodSync(filePath, 0o600);
+  const bytes = byteLen(prompt);
+  const sha256 = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex');
+  return { filePath, bytes, sha256 };
+}
+
+function buildBootstrapPrompt(payload) {
+  return [
+    'Continue this handoff from a secure local payload file.',
+    '',
+    `Payload file: ${payload.filePath}`,
+    `Payload bytes: ${payload.bytes}`,
+    `Payload sha256: ${payload.sha256}`,
+    '',
+    'Read the payload file in full and treat its exact contents as the initial handoff prompt/context.',
+    'Do not truncate it. Do not summarize it. Do not re-summarize it with another model.',
+    'After you have fully ingested it and no longer need the local payload file, delete only that payload file.',
+  ].join('\n');
+}
+
+async function buildLaunchPlan(targetIdentity, prompt, { dryRun = false } = {}) {
+  const profile = profileByTarget(catalog, targetIdentity);
+  const extraArgs = profile.agent === 'codex' ? await getDefaultHandoffInitArgs('codex', []) : [];
+  const payload = dryRun
+    ? {
+        filePath: '<secure-payload-file>',
+        bytes: byteLen(prompt),
+        sha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+      }
+    : writePayloadFile(prompt);
+  const bootstrapPrompt = buildBootstrapPrompt(payload);
+  const args = [...(profile.launch?.args || []), ...extraArgs, bootstrapPrompt];
+  const env = profile.launch?.env || {};
+  return {
+    targetIdentity,
+    binary: profile.launch.command,
+    args,
+    extraArgs,
+    env,
+    transport: 'secure file',
+    payload,
+    promptBytes: byteLen(prompt),
+    bootstrapBytes: byteLen(bootstrapPrompt),
+    argvBytes: serializedBytes([profile.launch.command, ...args]),
+    envBytes: currentEnvBytes(env),
+  };
+}
+
+function currentEnvBytes(extra = {}) {
+  return serializedBytes(Object.entries({ ...process.env, ...extra }).map(([key, value]) => `${key}=${value ?? ''}`));
+}
+
+async function launch(targetIdentity, prompt, cwd) {
+  cleanupStalePayloads();
+  const plan = await buildLaunchPlan(targetIdentity, prompt);
+  const child = spawn(plan.binary, plan.args, {
+    cwd,
+    stdio: 'inherit',
+    env: { ...process.env, ...plan.env },
+  });
+  return new Promise((resolve, reject) => {
+    child.on('error', (err) => {
+      try {
+        if (plan.payload?.filePath) fs.unlinkSync(plan.payload.filePath);
+      } catch {
+        // best-effort cleanup after failed exec
+      }
+      reject(err);
+    });
+    child.on('exit', (code) => resolve(code ?? 0));
+  });
+}
+
+function parseArgv(argv) {
+  const flags = { dryRun: false, source: null, sessionId: null, preset: null, go: false, allowLarge: false, status: false, help: false };
+  let target = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--dry-run') flags.dryRun = true;
+    else if (a === '--status') flags.status = true;
+    else if (a === '--help' || a === '-h') flags.help = true;
+    else if (a === '--full') flags.preset = 'full';
+    else if (a === '--standard') flags.preset = 'standard';
+    else if (a === '--go') flags.go = true;
+    else if (a === '--allow-large') flags.allowLarge = true;
+    else if (a === '--source') flags.source = argv[++i];
+    else if (a === '--session-id') flags.sessionId = argv[++i];
+    else if (!a.startsWith('--') && !target) target = a;
+    else {
+      console.error(`Unknown argument: ${a}`);
+      process.exit(1);
+    }
+  }
+  return { flags, target };
+}
+
+function printHelp() {
+  console.log(`${PROGRAM} — keep Codex work moving when one account reaches its limit
+
+Getting started
+  ${PROGRAM} setup                 find agents and save a fallback chain
+  ${PROGRAM} status                show whether automatic failover is ready
+
+Automatic use
+  ${PROGRAM} run <target>          supervise one Codex profile
+
+Manual handoff
+  ${PROGRAM}                       pick a session and a target
+  ${PROGRAM} <target>              hand that session to one profile
+
+Inspection
+  ${PROGRAM} agents                list agents and profiles on this machine
+  ${PROGRAM} usage                 show live Codex quota where it can be read
+  ${PROGRAM} targets               list profiles that can receive a handoff
+  ${PROGRAM} fallback              show or set the saved chain
+  ${PROGRAM} next <target>         plan the next verified profile
+
+Advanced
+  ${PROGRAM} --status              predecessor session, without launching
+  ${PROGRAM} --dry-run <target>    show a manual handoff, without launching
+  ${PROGRAM} doctor                check this install
+  ${PROGRAM} uninstall --dry-run   show CarryForward files that would be removed
+
+Run a command with --help for its own flags.
+`);
+}
+
+async function runStatus() {
+  const cwd = process.cwd();
+  const candidates = await collectTopPerIdentity(sourceProfiles(catalog).map((profile) => profile.target), cwd);
+  const result = pickFromCandidates(candidates);
+  console.log(`CURRENT DIRECTORY: ${cwd}\n`);
+  if (result.status === 'none') {
+    console.log('LIKELY PREDECESSOR: none found');
+  } else if (result.status === 'ambiguous') {
+    console.log('LIKELY PREDECESSOR: ambiguous — top candidates:');
+    for (const c of result.candidates) {
+      console.log(`  ${c.identity}: session ${c.session.id}  cwd=${c.session.cwd || '(unknown)'}  updated=${c.session.updatedAt}`);
+    }
+  } else {
+    const pick = result.pick;
+    const ending = classifyEnding(pick.identity, pick.session.originalPath);
+    console.log(`LIKELY PREDECESSOR: ${labelFor(pick.identity)}`);
+    console.log(`SOURCE: ${pick.identity}`);
+    console.log(`SESSION ID: ${pick.session.id}`);
+    console.log(`SESSION CWD: ${pick.session.cwd || '(unknown)'}`);
+    console.log(`LAST ACTIVITY: ${pick.session.updatedAt}`);
+    console.log(`ENDING: ${ending.abrupt ? 'abrupt' : 'clean'} — ${ending.reason}`);
+    console.log(`RECOMMENDED PRESET: ${ending.abrupt ? 'full' : 'standard'}`);
+    if (result.note) console.log(`(selected by: ${result.note})`);
+  }
+  const dests = destinationProfiles(catalog);
+  console.log(`\nAVAILABLE TARGETS: ${dests.map((profile) => profile.target).join(', ') || '(none)'}`);
+  for (const profile of dests) {
+    const env = profile.launch?.env || {};
+    for (const [key, value] of Object.entries(env)) {
+      console.log(`  ${profile.target} ${key}: ${value}`);
+    }
+  }
+
+  const rtk = checkRtk();
+  console.log('\nToken stack:');
+  console.log(`  ${padDots(rtk.ok ? `RTK ${rtk.version}` : 'RTK', 20)}${rtk.ok ? 'OK' : `NOT FOUND (${rtk.detail})`}`);
+  for (const profile of dests) {
+    const caveman = checkCaveman(profile.target);
+    console.log(`  ${padDots(`Caveman (${profile.target})`, 32)}${caveman.state}`);
+  }
+  console.log(`  ${padDots('Caveman Proxy', 26)}${checkCavemanProxy().state}`);
+  console.log('  Handoff compression ... cli-continues only (no RTK/Caveman pass on the handoff itself)');
+}
+
+// Resolves WHICH predecessor session to use for `target`, honoring
+// --session-id / --source / auto-detect in that order. Used by the CLI path
+// only — the interactive menu resolves its pick by direct user selection
+// instead, then both paths converge on describeHandoff()/executeLaunch().
+async function resolvePickForTarget(target, flags) {
+  const cwd = process.cwd();
+
+  if (flags.sessionId) {
+    const found = await findBySessionId(flags.sessionId, flags.source);
+    if (!found) {
+      console.error(`No session found matching id '${flags.sessionId}'${flags.source ? ` in ${flags.source}` : ''}.`);
+      process.exit(1);
+    }
+    return { pick: { identity: found.__identity, session: found } };
+  }
+  if (flags.source) {
+    const resolved = resolveSource(catalog, flags.source);
+    if (!resolved.ok) {
+      const sources = sourceProfiles(catalog).map((profile) => profile.target).join(', ') || '(none)';
+      console.error(resolved.code === 'not-source'
+        ? `${resolved.id} cannot be a handoff source.`
+        : `Unknown --source '${flags.source}'. Sources: ${sources}`);
+      process.exit(1);
+    }
+    const sessions = await allSessionsFor(resolved.profile.target);
+    if (!sessions.length) {
+      console.error(`No sessions found for ${resolved.profile.target}.`);
+      process.exit(1);
+    }
+    sessions.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    return { pick: { identity: resolved.profile.target, session: sessions[0] } };
+  }
+
+  const others = sourceProfiles(catalog).map((profile) => profile.target).filter((id) => id !== target);
+  const candidates = await collectTopPerIdentity(others, cwd);
+  const result = pickFromCandidates(candidates);
+  if (result.status === 'none') {
+    console.error('No predecessor session found.');
+    process.exit(1);
+  }
+  if (result.status === 'ambiguous') {
+    console.log('Ambiguous predecessor — a wrong handoff is worse than asking, so pick one explicitly:\n');
+    for (const c of result.candidates) {
+      console.log(`  --source ${c.identity}   (session ${c.session.id}, cwd=${c.session.cwd || '(unknown)'}, updated ${c.session.updatedAt})`);
+    }
+    console.log(`\nOr pass --session-id <id> [--source <identity>], or run plain \`${PROGRAM}\` for the menu.`);
+    process.exit(1);
+  }
+  return { pick: result.pick, note: result.note };
+}
+
+// THE single backend both the CLI and the interactive menu call: classify
+// the predecessor's ending, extract context via cli-continues, and print
+// the confirmation block (also what a dry-run's output IS). Never launches.
+async function describeHandoff(target, pick, note, flags) {
+  const sourceIdentity = pick.identity;
+  const session = pick.session;
+  const ending = classifyEnding(sourceIdentity, session.originalPath);
+  const preset = flags.preset || (ending.abrupt ? 'full' : 'standard');
+
+  const { extract } = await loadParserModule(sourceIdentity);
+  const config = await getPreset(preset);
+  const context = await extract(session, config);
+  const approxTokens = Math.ceil(context.markdown.length / 4);
+  const promptBytes = byteLen(buildPrompt(sourceIdentity, session, context.markdown, flags.go));
+
+  const destination = profileByTarget(catalog, target);
+  if (!flags.quiet) {
+    console.log(`Source: ${labelFor(sourceIdentity)}`);
+    console.log(`Source target: ${sourceIdentity}`);
+    console.log(`Session: ${session.id}`);
+    console.log(`Source cwd: ${session.cwd || '(unknown)'}`);
+    if (note) console.log(`(auto-selected by: ${note})`);
+    console.log(`End state: ${ending.abrupt ? 'abrupt' : 'clean'} — ${ending.reason}`);
+    console.log(`Context profile: ${preset}`);
+    console.log('Strategy: forced text injection (native resume is never used)');
+    console.log('Transport: secure file (safe from ARG_MAX; argv carries only a bootstrap prompt)');
+    console.log(`Estimated context: ~${approxTokens.toLocaleString()} tokens`);
+    console.log(`Handoff bytes: ${promptBytes.toLocaleString()}`);
+    console.log(`Destination target: ${target}`);
+    console.log(`Destination profile: ${destination?.profile || '(unknown)'}`);
+    console.log(`Launch executable: ${destination?.launch?.command || '(none)'}`);
+    const overrides = destination?.launch?.env || {};
+    const overrideKeys = Object.keys(overrides);
+    if (overrideKeys.length) {
+      console.log('Environment overrides:');
+      for (const key of overrideKeys) console.log(`  ${key}=${overrides[key]}`);
+    } else {
+      console.log('Environment overrides: (none)');
+    }
+    console.log(`Project: ${process.cwd()}`);
+
+    printTokenStack(target);
+  }
+
+  return { sourceIdentity, session, ending, preset, context, approxTokens, promptBytes };
+}
+
+// Never blocks continuity by itself. `block=true` (plain CLI launch without
+// --allow-large) refuses; `block=false` (dry-run, or the interactive menu
+// where the human's Enter-to-launch IS the explicit consent) only warns.
+function reportLargeIfNeeded(approxTokens, block) {
+  if (approxTokens <= LARGE_TOKEN_THRESHOLD) return true;
+  console.log(`\nWARNING: unusually large handoff context (~${approxTokens.toLocaleString()} tokens).`);
+  console.log('Transport: secure file (safe from ARG_MAX)');
+  if (block) {
+    console.log('Refusing to launch. Re-run with --allow-large to proceed anyway.');
+    return false;
+  }
+  return true;
+}
+
+async function executeLaunch(target, sourceIdentity, session, markdown, flags) {
+  const prompt = buildPrompt(sourceIdentity, session, markdown, flags.go);
+  console.log('\nLaunching...');
+  const code = await launch(target, prompt, process.cwd());
+  process.exit(code);
+}
+
+async function runHandoff(target, flags) {
+  const { pick, note } = await resolvePickForTarget(target, flags);
+  const info = await describeHandoff(target, pick, note, flags);
+
+  const block = !flags.dryRun && !flags.allowLarge;
+  if (!reportLargeIfNeeded(info.approxTokens, block)) process.exit(1);
+
+  if (flags.dryRun) {
+    const prompt = buildPrompt(info.sourceIdentity, info.session, info.context.markdown, flags.go);
+    const plan = await buildLaunchPlan(target, prompt, { dryRun: true });
+    console.log(`\nLaunch command: ${plan.binary} "<secure-file-bootstrap-prompt>"`);
+    const planKeys = Object.keys(plan.env || {});
+    if (planKeys.length) {
+      console.log(`Launch environment: ${planKeys.map((key) => `${key}=${plan.env[key]}`).join(', ')}`);
+    }
+    console.log(`Transport: ${plan.transport} (payload file not created in dry-run)`);
+    console.log(`Payload bytes: ${plan.promptBytes.toLocaleString()}`);
+    console.log(`Bootstrap argv bytes: ${plan.argvBytes.toLocaleString()}`);
+    console.log(`Environment bytes: ${plan.envBytes.toLocaleString()}`);
+    console.log('(dry run — target was not launched)');
+    return;
+  }
+
+  await executeLaunch(target, info.sourceIdentity, info.session, info.context.markdown, flags);
+}
+
+// Interactive frontend. Pure UI: it never extracts context or launches
+// anything itself — it only picks {identity, session, target} and then calls
+// the exact same describeHandoff()/executeLaunch() the CLI path uses, so menu
+// and explicit `--source/--session-id` runs are guaranteed to agree.
+async function runInteractive() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log('Interactive mode requires a TTY.');
+    printHelp();
+    process.exitCode = 1;
+    return;
+  }
+
+  const clack = await loadClack();
+  clack.intro(`${PROGRAM} — choose work to continue`);
+
+  const cwd = process.cwd();
+  const spin = clack.spinner();
+  spin.start('Scanning source profiles...');
+  let rows;
+  try {
+    rows = await gatherMenuRows(cwd, 20);
+  } finally {
+    spin.stop(`${rows ? rows.length : 0} session(s) found`);
+  }
+
+  if (!rows.length) {
+    clack.outro('No sessions found to continue.');
+    return;
+  }
+
+  const labels = projectLabels(rows);
+  const sessionChoice = await clack.select({
+    message: 'Continue which session?',
+    options: rows.map((row, i) => ({
+      value: i,
+      label: formatMenuRow(row, labels[i]),
+      hint: `${row.session.cwd || '(unknown dir)'} · ${row.session.id.slice(0, 8)}`,
+    })),
+    initialValue: 0,
+  });
+  if (clack.isCancel(sessionChoice)) {
+    clack.cancel('Cancelled — nothing launched.');
+    return;
+  }
+  const chosen = rows[sessionChoice];
+
+  const targetChoice = await clack.select({
+    message: `Continue ${labelFor(chosen.identity)} (${labels[sessionChoice].label}) with:`,
+    options: destinationProfiles(catalog).map((profile) => ({ value: profile.target, label: profile.target })),
+    initialValue: nextDestination(chosen.identity),
+  });
+  if (clack.isCancel(targetChoice)) {
+    clack.cancel('Cancelled — nothing launched.');
+    return;
+  }
+
+  const pick = { identity: chosen.identity, session: chosen.session };
+  const flags = { dryRun: false, source: null, sessionId: null, preset: null, go: false, allowLarge: false };
+  const info = await describeHandoff(targetChoice, pick, undefined, flags);
+  reportLargeIfNeeded(info.approxTokens, false);
+
+  const proceed = await clack.confirm({
+    message: 'Press Enter to launch (Esc/q to cancel)',
+    active: 'Launch',
+    inactive: 'Cancel',
+    initialValue: true,
+  });
+  if (clack.isCancel(proceed) || !proceed) {
+    clack.cancel('Cancelled — nothing launched.');
+    return;
+  }
+
+  clack.outro(`Launching ${targetChoice}...`);
+  await executeLaunch(targetChoice, info.sourceIdentity, info.session, info.context.markdown, flags);
+}
+
+async function supervisedHandoff({ sourceTarget, session, destination }) {
+  loadCatalog();
+  const matched = matchBoundSession(await allSessionsFor(sourceTarget), session);
+  if (!matched.ok) return { ok: false, error: 'bound session was not found' };
+  const flags = { preset: 'full', go: false, quiet: true, allowLarge: true, dryRun: false };
+  let info;
+  try {
+    info = await describeHandoff(destination, { identity: sourceTarget, session: matched.session }, undefined, flags);
+  } catch {
+    return { ok: false, error: 'handoff extract failed' };
+  }
+  const prompt = buildPrompt(sourceTarget, matched.session, info.context.markdown, false);
+  if (prompt.includes('**Continue the work.**')) return { ok: false, error: 'handoff extract failed' };
+  let plan;
+  try {
+    plan = await buildLaunchPlan(destination, prompt);
+  } catch {
+    return { ok: false, error: 'handoff extract failed' };
+  }
+  if (!plan?.binary) return { ok: false, error: 'handoff extract failed' };
+  return {
+    ok: true,
+    plan,
+    bytes: plan.promptBytes,
+    tokens: info.approxTokens,
+    sessionId: matched.session.id,
+  };
+}
+
+async function main() {
+  PAYLOAD_DIR = defaultCacheDir();
+  if (process.argv[2] === 'agents') {
+    process.exitCode = await runAgents(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'targets') {
+    process.exitCode = await runTargets(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'usage') {
+    process.exitCode = await runUsage(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'setup') {
+    process.exitCode = await runSetup(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'status') {
+    process.exitCode = await runProductStatus(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'doctor') {
+    process.exitCode = await runDoctor(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'uninstall') {
+    process.exitCode = await runUninstall(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'fallback') {
+    process.exitCode = await runFallback(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'next') {
+    process.exitCode = await runNext(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === 'run') {
+    process.exitCode = await runSupervised(process.argv.slice(3), {
+      signals: true,
+      deps: { buildHandoff: supervisedHandoff },
+    });
+    return;
+  }
+  loadCatalog();
+  if (process.argv.length === 2) {
+    await runInteractive();
+    return;
+  }
+
+  const { flags, target } = parseArgv(process.argv.slice(2));
+  if (flags.help || (!target && !flags.status)) {
+    printHelp();
+    return;
+  }
+  if (flags.status) {
+    await runStatus();
+    return;
+  }
+  const resolved = resolveDestination(catalog, target);
+  if (!resolved.ok) {
+    console.error(destinationFailure(resolved, target));
+    process.exit(1);
+  }
+  await runHandoff(resolved.profile.target, flags);
+}
+
+main().catch((err) => {
+  console.error(`${PROGRAM} failed:`, err.message);
+  process.exit(1);
+});

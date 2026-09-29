@@ -1,0 +1,28 @@
+{
+  "name": "carryforward",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CarryForward keeps Codex work moving when one account reaches its usage limit.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "bin/",
+    "lib/",
+    "install.sh",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md",
+    "third_party/cli-continues/LICENSE",
+    "third_party/cli-continues/VENDOR.json"
+  ],
+  "bin": {
+    "carryforward": "./bin/carryforward"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test test/smoke.mjs test/agents.test.mjs test/targets.test.mjs test/usage.test.mjs test/policy.test.mjs test/supervisor.test.mjs test/setup.test.mjs test/product.test.mjs",
+    "start": "node ./bin/carryforward"
+  }
+}
