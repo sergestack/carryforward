@@ -1,10 +1,8 @@
 # CarryForward demo storyboard
 
-Target length: 15 seconds. Record a terminal at a readable size. Use example profile names such as `codex:default` and `codex:east`.
+The published recording is [carryforward-demo.gif](carryforward-demo.gif). It is a scripted terminal, about 14 seconds, built from CarryForward's own status text and the supervisor lines for a scripted `usage_limit_exceeded` event. It does not launch Codex and does not use a real account.
 
-Do not exhaust a real Codex account to record this. Do not show usernames, email addresses, account ids, private paths, or project names.
-
-The GIF is not recorded yet. When it exists, save it as `assets/demo/carryforward-demo.gif` and show it from the README.
+Use the notes below to re-record it. Keep fictional profile names such as `codex:default` and `codex:east`. Do not show usernames, email addresses, account ids, private paths, or project names. Do not exhaust a real Codex account.
 
 ## Shots
 

@@ -37,11 +37,9 @@ No telemetry, and account grouping does not read credential files.
 
 ## See it in action
 
-A short recording will live at `assets/demo/carryforward-demo.gif`. It has not been recorded yet.
+<img src="assets/demo/carryforward-demo.gif" alt="Scripted terminal demo: carryforward status shows two Codex pools, then a simulated limit carries the session from codex:default to codex:east" width="860">
 
-<!-- assets/demo/carryforward-demo.gif is not in the repository yet. Do not link a missing image. -->
-
-The 15-second shot list is in [assets/demo/README.md](assets/demo/README.md). Record it with a simulated quota event. Do not exhaust a real Codex account to make the demo.
+Fictional profiles only. The recording does not launch Codex or use a real account. The shot list is in [assets/demo/README.md](assets/demo/README.md).
 
 ## Quick start
 
