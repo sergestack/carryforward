@@ -451,7 +451,9 @@ test('public files do not carry a personal identity', () => {
   for (const file of files) {
     const text = fs.readFileSync(file, 'utf8');
     assert.doesNotMatch(text, forbidden, file);
-    const stripped = copyrightFiles.has(file) ? text.replaceAll(copyrightLine, '') : text;
+    const stripped = copyrightFiles.has(file)
+      ? text.replaceAll(copyrightLine, '').replaceAll('https://github.com/sergestack/carryforward', '')
+      : text;
     assert.doesNotMatch(stripped, login, file);
   }
   assert.match(fs.readFileSync(path.join(root, 'LICENSE'), 'utf8'), /MIT License/);

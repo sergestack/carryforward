@@ -1,32 +1,107 @@
 # CarryForward
 
-CarryForward keeps AI coding work moving when one Codex account reaches its usage limit.
+Keep coding when your AI agent hits its limit.
 
-It discovers the coding agents and profiles installed on this machine, learns which Codex profiles share one allowance, and can move the active session to another verified Codex account.
+![version 0.1.0](https://img.shields.io/badge/version-0.1.0-2f6f8f)
+![MIT license](https://img.shields.io/badge/license-MIT-3d6b4f)
+![macOS](https://img.shields.io/badge/macOS-supported-444c56)
+![Linux](https://img.shields.io/badge/Linux-supported-444c56)
+![Node.js 22.5 or newer](https://img.shields.io/badge/node-%3E%3D22.5-3d6b4f)
 
-## Install
+<img src="assets/carryforward-hero.svg" alt="Codex Account A reaches its limit, CarryForward moves the session to Codex Account B, and the work continues" width="680">
 
-macOS and Linux. Node.js 22.5 or newer.
+CarryForward detects the AI coding agents and Codex accounts on this machine, learns which profiles share one quota, and carries the active session to another verified Codex account when the current one runs out.
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+**⚡ Automatic failover**<br>
+Move to another verified Codex quota pool when the active account runs out.
+
+</td>
+<td width="33%" valign="top">
+
+**🔄 Context handoff**<br>
+Carry the active coding-session context forward without replaying the failed prompt.
+
+</td>
+<td width="33%" valign="top">
+
+**🔒 Local-first**<br>
+No telemetry, and account grouping does not read credential files.
+
+</td>
+</tr>
+</table>
+
+## See it in action
+
+A short recording will live at `assets/demo/carryforward-demo.gif`. It has not been recorded yet.
+
+<!-- assets/demo/carryforward-demo.gif is not in the repository yet. Do not link a missing image. -->
+
+The 15-second shot list is in [assets/demo/README.md](assets/demo/README.md). Record it with a simulated quota event. Do not exhaust a real Codex account to make the demo.
+
+## Quick start
+
+macOS or Linux. Node.js 22.5 or newer.
 
 ```bash
+git clone https://github.com/sergestack/carryforward.git
+cd carryforward
 ./install.sh
 carryforward setup
 carryforward run codex:default
 ```
 
-`install.sh` links `~/.local/bin/carryforward` at this checkout. It does not need sudo, and it does not download anything. An existing CarryForward config is left alone. If `~/.local/bin` is not on `PATH`, the installer prints the full command to run. If the bundled extractor is missing or does not match its pin, the installer stops and leaves `~/.local/bin/carryforward` unchanged.
+`./install.sh` links `~/.local/bin/carryforward` at this checkout. It does not need sudo and it does not download anything. If the bundled extractor is missing or does not match its pin, the installer stops and leaves any existing command link unchanged.
 
-`carryforward setup` lists what it found, groups Codex profiles that share an allowance, and asks before saving a chain. The chain keeps one profile from each independent quota pool. Within a pool, CarryForward prefers the profile named `default`. Otherwise it uses the profile name that sorts first. The account id is not a sort key and is not written to disk.
+`carryforward setup` lists what it found and asks before saving a chain.
+
+## Screenshots
+
+Example profile names from the command output. Nothing here is a live account.
+
+### Setup
+
+<img src="assets/screenshots/setup.png" alt="carryforward setup listing Codex profiles, a shared allowance, and the automatic chain" width="720">
+
+### Status
+
+<img src="assets/screenshots/status.png" alt="carryforward status showing two quota pools, remaining usage, and auto-failover ready" width="720">
+
+### Failover
+
+<img src="assets/screenshots/failover.png" alt="carryforward run reporting that codex:default reached its quota and continuing with codex:east" width="720">
+
+Recapture steps are in [assets/screenshots/README.md](assets/screenshots/README.md).
+
+## How it works
+
+CarryForward watches only the Codex process it started. When that session records `usage_limit_exceeded`, it plans the next verified pool, writes the prior context, stops that process, and opens the successor.
+
+```mermaid
+flowchart TD
+  A[Codex A] -->|limit| B[CarryForward]
+  B --> C["Policy / quota pools"]
+  C --> D[Codex B]
+  D --> E[Context continues]
+```
 
 ## Automatic failover
-
-`carryforward run codex:default` starts that Codex profile in the foreground and watches only the process it started. When that session records `usage_limit_exceeded`, CarryForward plans the next verified Codex profile, writes the prior context, stops only that process, and opens the successor. The failed prompt is not sent again.
 
 ```bash
 carryforward run codex:default
 ```
 
+Profiles signed into the same Codex account share one allowance. Setup keeps one profile from each independent pool. It prefers the profile named `default`. Otherwise it uses the profile name that sorts first. The account id is not a sort key and is not written to disk. Answer `n` during setup to pick a different profile from a shared pool.
+
+One Codex account is a supported setup. Automatic failover waits until a second independent Codex account exists. CarryForward does not put an agent whose quota it cannot verify on the automatic chain.
+
 A direct `codex` launch is not supervised. `carryforward <target>` remains a manual handoff.
+
+`carryforward run` with no saved chain stops and tells you to run `carryforward setup`. It does not invent a config file.
 
 ## Manual handoff
 
@@ -37,24 +112,22 @@ carryforward claude:default
 carryforward grok:default
 ```
 
-## Quota pools
+## Supported agents
 
-Codex profiles signed into the same account share one allowance. Setup explains that and suggests only one of them for automatic failover. During setup, answer `n` to pick a different profile from that pool.
+| Agent | Detect | Handoff | Live quota | Auto failover |
+| --- | --- | --- | --- | --- |
+| Codex | ✅ | ✅ | ✅ | ✅ |
+| Claude | ✅ | ✅ | — | — |
+| Grok | ✅ | ✅ | — | — |
+| Gemini | ✅ | launch | — | — |
+| OpenCode | ✅ | — | — | — |
+| Copilot | ✅ | — | — | — |
 
-One Codex account is a supported setup. Automatic failover waits until a second independent Codex account exists. CarryForward does not fill the chain with an agent whose quota it cannot verify.
-
-## Status
-
-```bash
-carryforward status
-carryforward doctor
-```
-
-`carryforward status` answers whether automatic failover is ready. `carryforward doctor` checks Node, this install, session directories, `lsof`, config, and live Codex usage. A missing optional agent is a warning.
+Gemini can be launched when it is installed. It has no session source. OpenCode and Copilot are discovered only.
 
 ## Privacy
 
-CarryForward does not read credential files to group accounts. Codex quota is read from that profile's local app-server usage call. The account id stays in memory for the length of the command and is compared only with other Codex profiles. Config stores profile names:
+CarryForward does not send telemetry. It does not read credential files to group accounts. Codex quota comes from that profile's local app-server usage call. The account id stays in memory for the length of the command and is compared only with other Codex profiles. Config stores profile names:
 
 ```json
 {
@@ -65,18 +138,17 @@ CarryForward does not read credential files to group accounts. Codex quota is re
 
 The file is `$CARRYFORWARD_CONFIG_HOME/fallback.json` when that variable is set, otherwise `$XDG_CONFIG_HOME/carryforward/fallback.json`, otherwise `~/.config/carryforward/fallback.json`, mode `0600`. A malformed file or an unsupported `version` is left unchanged.
 
-## Supported agents
+## Configuration
 
-| Agent | Detect | Manual handoff | Live quota | Auto failover |
-| --- | --- | --- | --- | --- |
-| Codex | yes | yes | yes | yes |
-| Claude | yes | yes | no | no |
-| Grok | yes | yes | no | no |
-| Gemini | yes | launch only | no | no |
-| OpenCode | yes | no | no | no |
-| Copilot | yes | no | no | no |
+```bash
+carryforward status
+carryforward doctor
+carryforward fallback
+carryforward fallback set codex:default codex:second
+carryforward next codex:default
+```
 
-Gemini can be launched when it is installed. It has no session source. OpenCode and Copilot are discovered only.
+`carryforward status` answers whether automatic failover is ready. `carryforward doctor` checks Node, this install, the bundled extractor, session directories, `lsof`, config, and live Codex usage. A missing optional agent is a warning. `carryforward next` plans the next verified profile and launches nothing.
 
 ## Platforms
 
@@ -89,12 +161,6 @@ macOS and Linux. Node.js 22.5 or newer. Automatic session binding uses `lsof` wh
 - If the active rollout cannot be identified uniquely, CarryForward leaves that session running.
 - Claude and Grok have no safe live quota meter.
 - `carryforward setup` does not create a chain unless you accept it.
-
-## Configuration
-
-`carryforward fallback` shows the saved chain. `carryforward fallback set codex:default codex:second` replaces it. `carryforward next codex:default` plans the next verified profile and launches nothing.
-
-`carryforward run` with no saved chain stops and tells you to run `carryforward setup`. It does not invent a config file.
 
 ## Uninstall
 

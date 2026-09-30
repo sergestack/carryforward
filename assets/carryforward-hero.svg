@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 560" role="img" aria-labelledby="title desc">
+  <title id="title">CarryForward</title>
+  <desc id="desc">Codex Account A has reached its limit. CarryForward moves the work to Codex Account B, which is available, and the work continues.</desc>
+  <rect width="760" height="560" rx="18" fill="#12151c"/>
+  <rect x="1" y="1" width="758" height="558" rx="17" fill="none" stroke="#343b49" stroke-width="1"/>
+
+  <text x="380" y="58" text-anchor="middle" fill="#9aa3b2" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" letter-spacing="1.8">CODEX ACCOUNT A</text>
+  <rect x="230" y="74" width="300" height="64" rx="10" fill="#1b2029" stroke="#5c3a38" stroke-width="1.5"/>
+  <text x="380" y="112" text-anchor="middle" fill="#e08a7a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700" letter-spacing="1.4">LIMIT REACHED</text>
+
+  <line x1="380" y1="150" x2="380" y2="182" stroke="#5c6575" stroke-width="1.5"/>
+  <path d="M373 174 L380 184 L387 174" fill="none" stroke="#5c6575" stroke-width="1.5" stroke-linejoin="round"/>
+
+  <rect x="190" y="196" width="380" height="86" rx="12" fill="#1b2029" stroke="#3d4656" stroke-width="1.5"/>
+  <rect x="202" y="212" width="4" height="54" rx="2" fill="#d2b072"/>
+  <text x="380" y="248" text-anchor="middle" fill="#f4f1ea" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="34" font-weight="700">CarryForward</text>
+
+  <line x1="380" y1="294" x2="380" y2="326" stroke="#5c6575" stroke-width="1.5"/>
+  <path d="M373 318 L380 328 L387 318" fill="none" stroke="#5c6575" stroke-width="1.5" stroke-linejoin="round"/>
+
+  <text x="380" y="356" text-anchor="middle" fill="#9aa3b2" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" letter-spacing="1.8">CODEX ACCOUNT B</text>
+  <rect x="230" y="372" width="300" height="64" rx="10" fill="#1b2029" stroke="#2f5c49" stroke-width="1.5"/>
+  <text x="380" y="410" text-anchor="middle" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700" letter-spacing="1.6">AVAILABLE</text>
+
+  <line x1="380" y1="448" x2="380" y2="480" stroke="#5c6575" stroke-width="1.5"/>
+  <path d="M373 472 L380 482 L387 472" fill="none" stroke="#5c6575" stroke-width="1.5" stroke-linejoin="round"/>
+
+  <text x="380" y="522" text-anchor="middle" fill="#f4f1ea" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="2.4">CONTINUE WORK</text>
+</svg>
