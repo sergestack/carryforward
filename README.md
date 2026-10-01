@@ -37,9 +37,11 @@ No telemetry, and account grouping does not read credential files.
 
 ## See it in action
 
-<img src="assets/demo/carryforward-demo.gif" alt="Scripted terminal demo: carryforward status shows two Codex pools, then a simulated limit carries the session from codex:default to codex:east" width="860">
+<img src="assets/demo/carryforward-demo.gif" alt="CarryForward detects Alpha’s quota limit and continues the same task with Beta, carrying the previous context forward" width="860">
 
-Fictional profiles only. The recording does not launch Codex or use a real account. The shot list is in [assets/demo/README.md](assets/demo/README.md).
+[High-quality MP4 demo](assets/demo/carryforward-demo.mp4)
+
+Real CarryForward failover with fictional agents and isolated profiles. No real accounts used. [Recording notes](assets/demo/README.md).
 
 ## Quick start
 

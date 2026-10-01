@@ -249,6 +249,24 @@ function runInstall(home, env = {}) {
   });
 }
 
+function isolatedInstallEnv(t, home, node = 'current') {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-test-bin-'));
+  t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
+  // Only installer prerequisites; never expose a host tool directory on PATH.
+  for (const name of ['bash', 'dirname', 'uname', 'mkdir', 'ln']) {
+    const executable = ['/usr/bin', '/bin'].map(dir => path.join(dir, name))
+      .find(file => {
+        try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; }
+      });
+    assert.ok(executable, `Missing installer prerequisite: ${name}`);
+    fs.symlinkSync(executable, path.join(bin, name));
+  }
+  if (node === 'current') fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  else if (node === 'old') fs.writeFileSync(path.join(bin, 'node'), '#!/bin/sh\necho v18.20.0\n', { mode: 0o755 });
+  else assert.equal(node, 'absent');
+  return { HOME: home, PATH: bin, TERM: 'dumb' };
+}
+
 function relativeTree(home) {
   const found = [];
   function walk(dir) {
@@ -300,30 +318,33 @@ test('install preserves config and replaces a carryforward symlink', () => {
   assert.equal(fs.existsSync(path.join(home, '.local', 'share', 'carryforward')), false);
 });
 
-test('install refuses a regular file and an old Node', () => {
+test('install refuses a regular file and an old Node', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-refuse-'));
   const binDir = path.join(home, '.local', 'bin');
   fs.mkdirSync(binDir, { recursive: true });
   const regular = path.join(binDir, 'carryforward');
   fs.writeFileSync(regular, 'keep\n');
-  const refused = runInstall(home);
+  const refused = spawnSync('bash', [installScript], {
+    encoding: 'utf8', env: isolatedInstallEnv(t, home),
+  });
+  assert.ifError(refused.error);
   assert.equal(refused.status, 1);
   assert.match(refused.stderr, /not a symlink/);
   assert.equal(fs.readFileSync(regular, 'utf8'), 'keep\n');
 
-  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-node-'));
-  fs.writeFileSync(path.join(fakeBin, 'node'), '#!/bin/sh\necho v18.20.0\n', { mode: 0o755 });
   const old = spawnSync('bash', [installScript], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-oldnode-')), PATH: `${fakeBin}:/usr/bin:/bin` },
+    env: isolatedInstallEnv(t, fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-oldnode-')), 'old'),
   });
+  assert.ifError(old.error);
   assert.equal(old.status, 1);
   assert.match(old.stderr, /Found 18\.20\.0/);
 
   const missing = spawnSync('bash', [installScript], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-nonode-')), PATH: '/usr/bin:/bin' },
+    env: isolatedInstallEnv(t, fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-nonode-')), 'absent'),
   });
+  assert.ifError(missing.error);
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /Node was not found/);
 });
@@ -491,34 +512,43 @@ test('the repository source does not name a previous product', () => {
   walk(root);
 });
 
-test('an empty home can run help, setup, status, doctor, and agents', () => {
+test('an empty home can run help, setup, status, doctor, and agents', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'carryforward-fresh-'));
-  const installed = runInstall(home, { PATH: `/usr/bin:/bin:${path.dirname(process.execPath)}` });
+  const env = isolatedInstallEnv(t, home);
+  const installed = spawnSync('bash', [installScript], { encoding: 'utf8', env });
+  assert.ifError(installed.error);
   assert.equal(installed.status, 0, installed.stderr);
-  const env = {
-    HOME: home,
-    PATH: `${path.join(home, '.local', 'bin')}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
-    TERM: 'dumb',
-  };
   const bin = path.join(home, '.local', 'bin', 'carryforward');
   const help = spawnSync(bin, ['--help'], { encoding: 'utf8', env });
+  assert.ifError(help.error);
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /carryforward setup/);
   const setup = spawnSync(bin, ['setup'], { encoding: 'utf8', env });
+  assert.ifError(setup.error);
   assert.equal(setup.status, 0, setup.stderr);
   assert.match(setup.stdout, /nothing it can launch/);
   assert.equal(fs.existsSync(path.join(home, '.config', 'carryforward', 'fallback.json')), false);
   const status = spawnSync(bin, ['status'], { encoding: 'utf8', env });
+  assert.ifError(status.error);
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /No supported agents were found/);
   const doctor = spawnSync(bin, ['doctor'], { encoding: 'utf8', env });
+  assert.ifError(doctor.error);
   assert.equal(doctor.status, 0, doctor.stderr);
   assert.match(doctor.stdout, /CarryForward doctor/);
   assert.match(doctor.stdout, /cli-continues 4\.1\.1/);
   assert.match(doctor.stdout, /none found/);
   const agents = spawnSync(bin, ['agents'], { encoding: 'utf8', env });
+  assert.ifError(agents.error);
   assert.equal(agents.status, 0, agents.stderr);
   assert.match(agents.stdout, /not installed/);
+  // Prove agent discovery still works when we explicitly install a fixture.
+  fs.writeFileSync(path.join(env.PATH, 'gemini'), '#!/bin/sh\necho gemini-fixture-1.0\n', { mode: 0o755 });
+  const withGemini = spawnSync(bin, ['status'], { encoding: 'utf8', env });
+  assert.ifError(withGemini.error);
+  assert.equal(withGemini.status, 0, withGemini.stderr);
+  assert.match(withGemini.stdout, /gemini:default\s+manual only/);
+  assert.doesNotMatch(withGemini.stdout, /No supported agents were found/);
   const created = relativeTree(home);
   assert.ok(created.every((file) => file === '.local' || file.startsWith(`.local${path.sep}`)));
   assert.equal(created.includes(path.join('.local', 'bin', 'carryforward')), true);

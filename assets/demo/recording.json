@@ -1,0 +1,103 @@
+{
+  "duration": 10.658184879999999,
+  "events": [
+    {
+      "t": 0,
+      "text": "$ carryforward run codex:alpha\n"
+    },
+    {
+      "t": 0.754503985,
+      "text": "\nCodex · alpha\n\n"
+    },
+    {
+      "t": 0.754639809,
+      "text": "Working on: Add retry logic to API client\n\n"
+    },
+    {
+      "t": 1.4048465039999998,
+      "text": "✓ Reading src/client.js\n"
+    },
+    {
+      "t": 2.155770989,
+      "text": "✓ Found request handler\n"
+    },
+    {
+      "t": 2.856725152,
+      "text": "✓ Implementing retry logic...\n"
+    },
+    {
+      "t": 3.983365635,
+      "text": "CarryForward: codex:alpha reached its current quota.\nCarryForward: continuing with codex:beta.\n"
+    },
+    {
+      "t": 4.913271127999999,
+      "text": "\nCodex · beta\n\n"
+    },
+    {
+      "t": 5.715427914999999,
+      "text": "Context received from codex:alpha\n\n"
+    },
+    {
+      "t": 6.5167825839999995,
+      "text": "✓ src/client.js already inspected\n"
+    },
+    {
+      "t": 7.167989764,
+      "text": "✓ Retry implementation was in progress\n\n"
+    },
+    {
+      "t": 7.969618348,
+      "text": "Continuing...\n\n"
+    },
+    {
+      "t": 9.120023756999998,
+      "text": "✓ Added exponential backoff\n"
+    },
+    {
+      "t": 10.02124036,
+      "text": "✓ Tests passing\n"
+    }
+  ],
+  "audit": [
+    {
+      "event": "alpha-started",
+      "profile": "alpha"
+    },
+    {
+      "event": "structured-quota-appended",
+      "profile": "alpha",
+      "elapsedMs": 3000
+    },
+    {
+      "event": "initialize",
+      "profile": "beta"
+    },
+    {
+      "event": "initialize",
+      "profile": "alpha"
+    },
+    {
+      "event": "account/rateLimits/read",
+      "profile": "alpha"
+    },
+    {
+      "event": "account/rateLimits/read",
+      "profile": "beta"
+    },
+    {
+      "event": "alpha-stopped",
+      "profile": "alpha",
+      "signal": "SIGINT"
+    },
+    {
+      "event": "beta-context-verified",
+      "profile": "beta",
+      "exactSession": true,
+      "sha256Verified": true
+    },
+    {
+      "event": "beta-completed",
+      "profile": "beta"
+    }
+  ]
+}
